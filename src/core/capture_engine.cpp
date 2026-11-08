@@ -34,7 +34,10 @@ IDirect3DDxgiInterfaceAccess : public IUnknown {
 #include <condition_variable>
 #include <stdexcept>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <map>
+#include <string>
 
 namespace memoir {
 
@@ -56,6 +59,31 @@ static int64_t GetQPCFrequency() {
     LARGE_INTEGER li;
     QueryPerformanceFrequency(&li);
     return li.QuadPart;
+}
+
+// "step: HRESULT 0x887A0005: <system message>" for a WinRT error.
+// winrt::hresult_error does NOT derive from std::exception, so every boundary
+// that only catches std::exception lets it escape — out of an N-API callback
+// that means std::terminate() and a fail-fast process exit with no minidump.
+static std::string DescribeHresult(const char* step,
+                                   const winrt::hresult_error& e) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s: HRESULT 0x%08X: ", step,
+             static_cast<uint32_t>(e.code().value));
+    return std::string(buf) + winrt::to_string(e.message());
+}
+
+// Run one step of Start(); rethrow any WinRT error as std::runtime_error that
+// names the step, so callers (and logs) see which call failed and why.
+template <typename F>
+static auto Step(const char* step, F&& fn) -> decltype(fn()) {
+    try {
+        return fn();
+    } catch (const winrt::hresult_error& e) {
+        throw std::runtime_error(DescribeHresult(step, e));
+    } catch (const std::exception& e) {
+        throw std::runtime_error(std::string(step) + ": " + e.what());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +116,22 @@ struct CaptureEngine::Impl {
     // Current FramePool size (for ContentSize-change detection)
     uint32_t poolW = 0;
     uint32_t poolH = 0;
+    std::atomic<uint64_t> poolRecreates{0};
+
+    // FrameArrived runs on WinRT thread-pool threads and, with a free-threaded
+    // pool, can run concurrently. frameMutex serialises the handler body (pool
+    // Recreate + TryGetNextFrame must not race); callbacksInFlight lets Stop()
+    // wait for running handlers before it tears down the device they use.
+    std::mutex frameMutex;
+    std::atomic<int> callbacksInFlight{0};
+
+    // D3D adapter the capture device was created on (for cross-GPU issues).
+    std::string adapterDescription;
+
+    // Per-step error counts from OnFrameArrived, e.g. {"Recreate": 296}.
+    // Guarded by errorMutex, like lastPoolChange.
+    std::map<std::string, uint64_t> errorsByStep;
+    std::string lastPoolChange;
 
     // Frame queue
     std::queue<std::shared_ptr<FramePacket>> frameQueue;
@@ -134,6 +178,22 @@ struct CaptureEngine::Impl {
         winrt::check_hresult(
             CreateDirect3D11DeviceFromDXGIDevice(dxgi.get(), insp.put()));
         winrtDevice = insp.as<d3d::IDirect3DDevice>();
+
+        // Record which adapter we got: on hybrid-GPU machines the default
+        // adapter can differ from the one the game renders on.
+        adapterDescription.clear();
+        winrt::com_ptr<IDXGIAdapter> adapter;
+        DXGI_ADAPTER_DESC ad{};
+        if (SUCCEEDED(dxgi->GetAdapter(adapter.put())) &&
+            SUCCEEDED(adapter->GetDesc(&ad))) {
+            char buf[96];
+            snprintf(buf, sizeof(buf),
+                     " (vendor=0x%04X device=0x%04X luid=%08X:%08X fl=0x%X)",
+                     ad.VendorId, ad.DeviceId,
+                     static_cast<uint32_t>(ad.AdapterLuid.HighPart),
+                     ad.AdapterLuid.LowPart, static_cast<uint32_t>(achieved));
+            adapterDescription = winrt::to_string(ad.Description) + buf;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -198,9 +258,25 @@ struct CaptureEngine::Impl {
 
     // -----------------------------------------------------------------------
     void OnFrameArrived() {
+        // Counted before the state check: Stop() flips the state first and
+        // then waits for this to drop to zero, so no handler can still be
+        // running when it releases the device and pool.
+        callbacksInFlight++;
+        struct InFlight {
+            std::atomic<int>& n;
+            ~InFlight() { n--; }
+        } inFlight{callbacksInFlight};
+
+        // Which call is running, for the error report below.
+        const char* step = "state check";
         try {
             if (state.load() != EngineState::Running) return;
 
+            step = "frameMutex";
+            std::lock_guard frameLock(frameMutex);
+            if (state.load() != EngineState::Running) return;
+
+            step = "TryGetNextFrame";
             auto frame = framePool.TryGetNextFrame();
             if (!frame) return;
 
@@ -210,17 +286,27 @@ struct CaptureEngine::Impl {
             // so if the target window resized (incl. growing from a tiny
             // launch-time size), the pool must be recreated to match.
             {
+                step = "ContentSize";
                 auto cs = frame.ContentSize();
                 uint32_t cw = static_cast<uint32_t>(cs.Width);
                 uint32_t ch = static_cast<uint32_t>(cs.Height);
                 if (cw > 0 && ch > 0 && (cw != poolW || ch != poolH)) {
+                    step = "Recreate";
                     framePool.Recreate(
                         winrtDevice,
                         dx::DirectXPixelFormat::B8G8R8A8UIntNormalized,
                         2, {static_cast<int32_t>(cw),
                             static_cast<int32_t>(ch)});
+                    {
+                        char buf[96];
+                        snprintf(buf, sizeof(buf), "%ux%u -> %ux%u", poolW,
+                                 poolH, cw, ch);
+                        std::lock_guard lk(errorMutex);
+                        lastPoolChange = buf;
+                    }
                     poolW = cw;
                     poolH = ch;
+                    poolRecreates++;
                     // Continue processing this frame at its old (texture) size;
                     // subsequent FrameArrived events will deliver at new size.
                 }
@@ -248,14 +334,17 @@ struct CaptureEngine::Impl {
             lastAcceptQPC = now;
 
             uint64_t fid         = nextFrameId++;
+            step = "SystemRelativeTime";
             int64_t  captureQpc  = frame.SystemRelativeTime().count();
             int64_t  hostQpc     = now;
             uint64_t kbMask      = SnapshotKeyboard(config.key_map);
 
             // Get captured texture
+            step = "Surface";
             auto surface = frame.Surface();
             auto access  = surface.as<IDirect3DDxgiInterfaceAccess>();
             winrt::com_ptr<ID3D11Texture2D> srcTex;
+            step = "GetInterface(texture)";
             winrt::check_hresult(
                 access->GetInterface(IID_PPV_ARGS(srcTex.put())));
 
@@ -275,9 +364,12 @@ struct CaptureEngine::Impl {
             // GPU copy → staging → CPU readback
             {
                 std::lock_guard lk(contextMutex);
+                step = "EnsureStaging";
                 EnsureStaging(td.Width, td.Height);
+                step = "CopyResource";
                 context->CopyResource(stagingTex.get(), srcTex.get());
 
+                step = "Map";
                 D3D11_MAPPED_SUBRESOURCE mapped{};
                 HRESULT hr = context->Map(stagingTex.get(), 0,
                                           D3D11_MAP_READ, 0, &mapped);
@@ -289,12 +381,13 @@ struct CaptureEngine::Impl {
                     std::memcpy(pkt->pixel_data.data(), mapped.pData, bytes);
                     context->Unmap(stagingTex.get(), 0);
                 } else {
-                    framesDroppedInternalError++;
-                    frame.Close();
-                    return;
+                    // Throw so it's reported (with the HRESULT and, for a
+                    // removed device, the reason) like every other step.
+                    winrt::throw_hresult(hr);
                 }
             }
 
+            step = "Close";
             frame.Close();
 
             // Recording (uses CPU pixel data — resize + NVENC encode)
@@ -325,12 +418,70 @@ struct CaptureEngine::Impl {
             queueCV.notify_one();
             framesAccepted++;
 
+        } catch (const winrt::hresult_error& e) {
+            std::string msg = DescribeHresult(step, e);
+            if (e.code() == DXGI_ERROR_DEVICE_REMOVED && device) {
+                char buf[48];
+                snprintf(buf, sizeof(buf), " (removed reason 0x%08X)",
+                         static_cast<uint32_t>(
+                             device->GetDeviceRemovedReason()));
+                msg += buf;
+            }
+            RecordFrameError(step, "OnFrameArrived " + msg);
         } catch (const std::exception& e) {
-            framesDroppedInternalError++;
-            SetError(e.what());
+            RecordFrameError(step, std::string("OnFrameArrived ") + step +
+                                       ": " + e.what());
         } catch (...) {
-            framesDroppedInternalError++;
+            RecordFrameError(step, std::string("OnFrameArrived ") + step +
+                                       ": unknown native exception");
         }
+    }
+
+    // Tear down the WGC session/pool and D3D objects. Callers set state to
+    // Stopping first. Never throws: Close() on WinRT objects can fail with an
+    // hresult_error (e.g. RO_E_CLOSED), and an exception out of Stop() or the
+    // destructor would terminate the process.
+    void ReleaseCaptureResources() {
+        try { frameArrivedRevoker.revoke(); } catch (...) {}
+        try { closedRevoker.revoke(); } catch (...) {}
+
+        // revoke() stops new FrameArrived calls but doesn't wait for ones
+        // already running on thread-pool threads, which may be using the pool
+        // and device we're about to release. Wait for them (they bail out
+        // quickly once they see state != Running). Bounded so a wedged
+        // handler can't hang shutdown.
+        for (int i = 0; i < 2000 && callbacksInFlight.load() > 0; i++) {
+            Sleep(1);
+        }
+
+        if (session) {
+            try { session.Close(); } catch (...) {}
+            session = nullptr;
+        }
+        if (framePool) {
+            try { framePool.Close(); } catch (...) {}
+            framePool = nullptr;
+        }
+        captureItem = nullptr;
+
+        {
+            std::lock_guard lk(contextMutex);
+            stagingTex = nullptr;
+            stagingW = 0;
+            stagingH = 0;
+        }
+        poolW = 0;
+        poolH = 0;
+        context     = nullptr;
+        device      = nullptr;
+        winrtDevice = nullptr;
+    }
+
+    void RecordFrameError(const char* step, const std::string& msg) {
+        framesDroppedInternalError++;
+        std::lock_guard lk(errorMutex);
+        lastError = msg;
+        errorsByStep[step]++;
     }
 
     // -----------------------------------------------------------------------
@@ -384,48 +535,80 @@ void CaptureEngine::Start() {
     impl_->framesDroppedQueueFull.store(0);
     impl_->framesDroppedInternalError.store(0);
     impl_->framesRecorded.store(0);
+    impl_->poolRecreates.store(0);
+    {
+        std::lock_guard lk(impl_->errorMutex);
+        impl_->errorsByStep.clear();
+        impl_->lastPoolChange.clear();
+    }
 
-    // D3D11
-    impl_->InitD3D11();
-
-    // Capture item
-    impl_->captureItem = impl_->CreateCaptureItem();
-    auto size = impl_->captureItem.Size();
-
-    // Frame pool (free-threaded – no DispatcherQueue required)
-    impl_->framePool = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
-        impl_->winrtDevice,
-        dx::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        2, size);
-    impl_->poolW = static_cast<uint32_t>(size.Width);
-    impl_->poolH = static_cast<uint32_t>(size.Height);
-
-    // Subscribe FrameArrived
-    impl_->frameArrivedRevoker = impl_->framePool.FrameArrived(
-        winrt::auto_revoke,
-        [raw = impl_.get()](auto const&, auto const&) {
-            raw->OnFrameArrived();
-        });
-
-    // Subscribe item Closed (target window closed / monitor removed)
-    impl_->closedRevoker = impl_->captureItem.Closed(
-        winrt::auto_revoke,
-        [raw = impl_.get()](auto const&, auto const&) {
-            raw->state.store(EngineState::Faulted);
-            raw->SetError("Capture target closed");
-            raw->queueCV.notify_all();
-        });
-
-    // Create & configure session
-    impl_->session = impl_->framePool.CreateCaptureSession(
-        impl_->captureItem);
-    try { impl_->session.IsBorderRequired(false); } catch (...) {}
+    // Every step is wrapped by Step(): a WinRT failure comes out as a
+    // std::runtime_error naming the step and HRESULT (e.g.
+    // "CreateForWindow: HRESULT 0x80070057: The parameter is incorrect.")
+    // instead of an hresult_error that callers can't catch generically.
     try {
-        impl_->session.IsCursorCaptureEnabled(impl_->config.capture_cursor);
-    } catch (...) {}
+        Step("D3D11CreateDevice", [&] { impl_->InitD3D11(); });
 
-    impl_->state.store(EngineState::Running);
-    impl_->session.StartCapture();
+        impl_->captureItem =
+            Step("CreateForWindow", [&] { return impl_->CreateCaptureItem(); });
+        auto size = Step("GraphicsCaptureItem.Size",
+                         [&] { return impl_->captureItem.Size(); });
+        if (size.Width <= 0 || size.Height <= 0) {
+            char buf[96];
+            snprintf(buf, sizeof(buf),
+                     "Capture target has an empty size (%dx%d)", size.Width,
+                     size.Height);
+            throw std::runtime_error(buf);
+        }
+
+        // Frame pool (free-threaded – no DispatcherQueue required)
+        impl_->framePool = Step("CreateFreeThreaded", [&] {
+            return wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
+                impl_->winrtDevice,
+                dx::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
+        });
+        impl_->poolW = static_cast<uint32_t>(size.Width);
+        impl_->poolH = static_cast<uint32_t>(size.Height);
+
+        // Subscribe FrameArrived
+        impl_->frameArrivedRevoker = Step("FrameArrived subscribe", [&] {
+            return impl_->framePool.FrameArrived(
+                winrt::auto_revoke,
+                [raw = impl_.get()](auto const&, auto const&) {
+                    raw->OnFrameArrived();
+                });
+        });
+
+        // Subscribe item Closed (target window closed / monitor removed)
+        impl_->closedRevoker = Step("Closed subscribe", [&] {
+            return impl_->captureItem.Closed(
+                winrt::auto_revoke,
+                [raw = impl_.get()](auto const&, auto const&) {
+                    raw->state.store(EngineState::Faulted);
+                    raw->SetError("Capture target closed");
+                    raw->queueCV.notify_all();
+                });
+        });
+
+        // Create & configure session
+        impl_->session = Step("CreateCaptureSession", [&] {
+            return impl_->framePool.CreateCaptureSession(impl_->captureItem);
+        });
+        try { impl_->session.IsBorderRequired(false); } catch (...) {}
+        try {
+            impl_->session.IsCursorCaptureEnabled(
+                impl_->config.capture_cursor);
+        } catch (...) {}
+
+        impl_->state.store(EngineState::Running);
+        Step("StartCapture", [&] { impl_->session.StartCapture(); });
+    } catch (...) {
+        // Leave the engine startable again and release what was created.
+        impl_->state.store(EngineState::Stopping);
+        impl_->ReleaseCaptureResources();
+        impl_->state.store(EngineState::Created);
+        throw;
+    }
 }
 
 void CaptureEngine::Stop() {
@@ -444,21 +627,7 @@ void CaptureEngine::Stop() {
         }
     }
 
-    impl_->frameArrivedRevoker.revoke();
-    impl_->closedRevoker.revoke();
-
-    if (impl_->session)   { impl_->session.Close();   impl_->session   = nullptr; }
-    if (impl_->framePool) { impl_->framePool.Close();  impl_->framePool = nullptr; }
-    impl_->captureItem = nullptr;
-
-    impl_->stagingTex = nullptr;
-    impl_->stagingW = 0;
-    impl_->stagingH = 0;
-    impl_->poolW = 0;
-    impl_->poolH = 0;
-    impl_->context    = nullptr;
-    impl_->device     = nullptr;
-    impl_->winrtDevice = nullptr;
+    impl_->ReleaseCaptureResources();
 
     impl_->state.store(EngineState::Stopped);
     impl_->queueCV.notify_all();
@@ -510,6 +679,18 @@ EngineStats CaptureEngine::GetStats() const {
     {
         std::lock_guard lk(impl_->recordingMutex);
         s.recording_active = (impl_->recordingSession != nullptr);
+    }
+    s.pool_recreates = impl_->poolRecreates.load();
+    s.pool_width     = impl_->poolW;
+    s.pool_height    = impl_->poolH;
+    s.adapter        = impl_->adapterDescription;
+    {
+        std::lock_guard lk(impl_->errorMutex);
+        s.last_pool_change = impl_->lastPoolChange;
+        for (const auto& [step, n] : impl_->errorsByStep) {
+            if (!s.errors_by_step.empty()) s.errors_by_step += ", ";
+            s.errors_by_step += step + "=" + std::to_string(n);
+        }
     }
     return s;
 }

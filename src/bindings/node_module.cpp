@@ -9,6 +9,24 @@
 
 using namespace memoir;
 
+// Rethrow the in-flight C++ exception as a JS error. Must be called from a
+// catch block. node-addon-api is built without NAPI_CPP_EXCEPTIONS here, so
+// nothing wraps our methods: any C++ exception that escapes one unwinds into
+// V8 and terminates the process (fail-fast, no minidump). Every method that
+// calls into the engine therefore ends with `catch (...) { ThrowAsJs(env); }`.
+static void ThrowAsJs(Napi::Env env) {
+    std::string msg;
+    try {
+        throw;
+    } catch (const std::exception& e) {
+        msg = e.what();
+    } catch (...) {
+        // e.g. a winrt::hresult_error the core failed to translate.
+        msg = "unknown native exception";
+    }
+    Napi::Error::New(env, msg).ThrowAsJavaScriptException();
+}
+
 // ─── JsFramePacket ──────────────────────────────────────────────
 
 class JsFramePacket : public Napi::ObjectWrap<JsFramePacket> {
@@ -210,16 +228,16 @@ public:
     void Start(const Napi::CallbackInfo& info) {
         try {
             engine_->Start();
-        } catch (const std::exception& e) {
-            Napi::Error::New(info.Env(), e.what()).ThrowAsJavaScriptException();
+        } catch (...) {
+            ThrowAsJs(info.Env());
         }
     }
 
     void Stop(const Napi::CallbackInfo& info) {
         try {
             engine_->Stop();
-        } catch (const std::exception& e) {
-            Napi::Error::New(info.Env(), e.what()).ThrowAsJavaScriptException();
+        } catch (...) {
+            ThrowAsJs(info.Env());
         }
     }
 
@@ -236,8 +254,8 @@ public:
             auto pkt = engine_->GetNextFrame(timeout_ms);
             if (!pkt) return info.Env().Null();
             return JsFramePacket::NewInstance(info.Env(), pkt);
-        } catch (const std::exception& e) {
-            Napi::Error::New(info.Env(), e.what()).ThrowAsJavaScriptException();
+        } catch (...) {
+            ThrowAsJs(info.Env());
             return info.Env().Undefined();
         }
     }
@@ -284,8 +302,8 @@ public:
             result.Set("width", static_cast<double>(ri.width));
             result.Set("height", static_cast<double>(ri.height));
             return result;
-        } catch (const std::exception& e) {
-            Napi::Error::New(info.Env(), e.what()).ThrowAsJavaScriptException();
+        } catch (...) {
+            ThrowAsJs(info.Env());
             return info.Env().Undefined();
         }
     }
@@ -293,8 +311,8 @@ public:
     void StopRecording(const Napi::CallbackInfo& info) {
         try {
             engine_->StopRecording();
-        } catch (const std::exception& e) {
-            Napi::Error::New(info.Env(), e.what()).ThrowAsJavaScriptException();
+        } catch (...) {
+            ThrowAsJs(info.Env());
         }
     }
 
@@ -314,6 +332,12 @@ public:
         obj.Set("framesRecorded", Napi::Number::New(info.Env(), static_cast<double>(s.frames_recorded)));
         obj.Set("queueDepth", s.python_queue_depth);
         obj.Set("recording", s.recording_active);
+        obj.Set("poolRecreates", Napi::Number::New(info.Env(), static_cast<double>(s.pool_recreates)));
+        obj.Set("poolWidth", s.pool_width);
+        obj.Set("poolHeight", s.pool_height);
+        obj.Set("lastPoolChange", s.last_pool_change);
+        obj.Set("adapter", s.adapter);
+        obj.Set("errorsByStep", s.errors_by_step);
         return obj;
     }
 

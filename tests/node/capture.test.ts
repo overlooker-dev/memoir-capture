@@ -18,11 +18,11 @@ afterEach(() => {
 
 describe('module-level', () => {
   it('ping returns expected string', () => {
-    expect(ping()).toBe('memoir-node 0.3.1 loaded OK')
+    expect(ping()).toBe('memoir-node 0.3.2 loaded OK')
   })
 
   it('version matches', () => {
-    expect(version).toBe('0.3.1')
+    expect(version).toBe('0.3.2')
   })
 })
 

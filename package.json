@@ -1,6 +1,6 @@
 {
   "name": "memoir-node",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Windows-native screen capture with Node.js bindings",
   "license": "MIT",
   "repository": {

@@ -74,6 +74,17 @@ export interface EngineStats {
   framesRecorded: number
   queueDepth: number
   recording: boolean
+  /** Times the frame pool was resized to a new window ContentSize. */
+  poolRecreates: number
+  /** Current frame pool size. */
+  poolWidth: number
+  poolHeight: number
+  /** Most recent pool resize, e.g. "1920x1080 -> 1904x1041" ("" if none). */
+  lastPoolChange: string
+  /** D3D adapter the capture device was created on. */
+  adapter: string
+  /** Frame errors per failing step, e.g. "Recreate=296, Map=2" ("" if none). */
+  errorsByStep: string
 }
 
 // ─── Meta Format ────────────────────────────────────────────────

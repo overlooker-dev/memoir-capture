@@ -60,6 +60,14 @@ struct EngineStats {
     uint64_t frames_recorded = 0;
     uint32_t python_queue_depth = 0;
     bool recording_active = false;
+
+    // Diagnostics
+    uint64_t pool_recreates = 0;      // frame pool resized to a new ContentSize
+    uint32_t pool_width = 0;          // current frame pool size
+    uint32_t pool_height = 0;
+    std::string last_pool_change;     // e.g. "1920x1080 -> 1904x1041"
+    std::string adapter;              // D3D adapter the capture device uses
+    std::string errors_by_step;       // e.g. "Recreate=296, Map=2"
 };
 
 std::vector<KeySpec> GetDefaultKeyMap();

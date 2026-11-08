@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.2
+
+### Fixed
+- **Process crash when capture failed to start.** `start()` (and `stop()`)
+  could fail with a WinRT `hresult_error`, which does not derive from
+  `std::exception`. The Node binding only caught `std::exception`, and it is
+  built without `NAPI_CPP_EXCEPTIONS`, so the error escaped into V8 and
+  terminated the host process via a fail-fast (no minidump). Every engine
+  step now reports WinRT failures as a regular error naming the step and the
+  HRESULT, e.g. `CreateForWindow: HRESULT 0x80070057: The parameter is
+  incorrect.`, and every binding method has a catch-all.
+- **Use-after-free on `stop()`.** `stop()` revoked the `FrameArrived` handler
+  and then released the frame pool and D3D device without waiting for
+  handlers already running on WinRT thread-pool threads. It now waits
+  (bounded, 2s) for in-flight handlers first. The handler body is also
+  serialised, since a free-threaded pool can invoke it concurrently.
+- A failed `start()` releases what it created and leaves the engine startable.
+- `start()` rejects a capture target with an empty size instead of creating a
+  zero-sized frame pool.
+
+### Added
+- Frame errors are no longer silent: `lastError()` now reports the failing
+  step and HRESULT (with the removal reason for `DXGI_ERROR_DEVICE_REMOVED`),
+  and `stats()` gains `errorsByStep`, `poolRecreates`, `poolWidth`,
+  `poolHeight`, `lastPoolChange` and `adapter` (the D3D adapter used for
+  capture).
+
 ## 0.3.1
 
 ### Fixed
